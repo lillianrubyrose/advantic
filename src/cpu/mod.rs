@@ -2,6 +2,7 @@ use crate::{Bits, System};
 use int_enum::IntEnum;
 
 mod parser;
+use crate::mem::Memory;
 use parser::{
 	DataProcessingCpsr, DataProcessingOpcode, HalfwordDataTransferMode, Indexing, Instruction, Offset, OffsetShift,
 	register_index, spsr_index,
@@ -32,8 +33,11 @@ pub struct Cpu {
 	registers: [u32; 31],
 	cpsr: u32,
 	spsr: [u32; 5],
+	mode: CpuMode,
 	pipeline_size: u8,
 	pub cycle: u32,
+	pc_sequential: bool,
+	paused: bool,
 }
 
 impl Cpu {
@@ -44,10 +48,13 @@ impl Cpu {
 	pub fn new() -> Self {
 		let mut cpu = Self {
 			registers: [0; _],
-			cpsr: 1 << 4 | CpuMode::Supervisor as u32,
+			mode: CpuMode::Supervisor,
+			cpsr: 0,
 			spsr: [0; _],
 			pipeline_size: 0,
 			cycle: 0,
+			pc_sequential: false,
+			paused: false,
 		};
 		cpu.pipeline_load();
 		cpu.pipeline_load();
@@ -58,15 +65,8 @@ impl Cpu {
 		if self.flag(flags::THUMB) { 2 } else { 4 }
 	}
 
-	fn pc(&self) -> u32 {
+	pub fn pc(&self) -> u32 {
 		self.registers[Self::PC]
-	}
-
-	fn set_pc(&mut self, value: u32) {
-		self.registers[Self::PC] = value & !(self.instruction_size() - 1);
-		self.pipeline_size = 0;
-		self.cycle();
-		self.cycle();
 	}
 
 	fn pipeline_load(&mut self) {
@@ -87,7 +87,10 @@ impl Cpu {
 
 	fn set_register(&mut self, register: usize, value: u32) {
 		if register == Self::PC {
-			self.set_pc(value);
+			self.registers[Self::PC] = value & !(self.instruction_size() - 1);
+			self.pipeline_size = 0;
+			self.cycle();
+			self.cycle();
 		} else {
 			self.registers[register] = value;
 		}
@@ -97,12 +100,17 @@ impl Cpu {
 		self.cpsr.bit(flag)
 	}
 
-	fn set_flag(&mut self, bit: u32, value: bool) {
-		self.cpsr.set_bit(bit, value);
+	fn cpsr(&self) -> u32 {
+		(self.cpsr & !0b1111) | (1 << 4) | self.mode as u32
 	}
 
-	fn set_mode(&mut self, mode: CpuMode) {
-		self.cpsr = self.cpsr & !0b1111 | mode as u32;
+	fn set_cpsr(&mut self, cpsr: u32) {
+		self.cpsr = cpsr;
+		self.mode = CpuMode::try_from((cpsr & 0b1111) as u8).expect("invalid CPSR mode");
+	}
+
+	fn set_flag(&mut self, bit: u32, value: bool) {
+		self.cpsr.set_bit(bit, value);
 	}
 
 	fn resolve_indexing(&mut self, index: Indexing, offset: u32) -> u32 {
@@ -157,49 +165,59 @@ impl Cpu {
 		value
 	}
 
-	fn read(&mut self, sys: &mut System, address: u32) -> u32 {
-		self.cycle();
-		sys.read(address)
+	fn read(&mut self, mem: &Memory, sys: &System, address: u32, size: u8, sequential: bool) -> u32 {
+		let Some(parsed) = mem.parse_address(address, 4, sequential) else {
+			eprintln!("reading from unknown address: {address:08x}");
+			return 0;
+		};
+		for _ in 0..parsed.cycles {
+			self.cycle();
+		}
+		mem.read(sys, parsed, size)
 	}
 
-	fn write(&mut self, sys: &mut System, address: u32, register: usize, size: u8) {
-		self.cycle();
-		sys.write(address, self.register(register), size);
+	fn write(&mut self, mem: &mut Memory, sys: &mut System, address: u32, register: usize, size: u8, sequential: bool) {
+		let Some(parsed) = mem.parse_address(address, size, sequential) else {
+			eprintln!("writing to unknown address: {address:08x}");
+			return;
+		};
+		for _ in 0..parsed.cycles {
+			self.cycle();
+		}
+		if address == 0x0400_0301 {
+			self.paused = true;
+		}
+		mem.write(sys, parsed, self.register(register), size);
 	}
 
-	fn load_dynamic_width(&mut self, sys: &mut System, address: u32, size: u8) -> u32 {
-		let value = self.read(sys, address).rotate_right(8 * (address % 4));
-		value & 1u32.unbounded_shl(u32::from(size) * 8).wrapping_sub(1)
-	}
-
-	pub fn step(&mut self, sys: &mut System) {
-		if !self.flag(flags::DISABLE_IRQ) && sys.read(0x0400_0208) != 0 {
-			let interrupts = sys.interrupts.0;
-			if interrupts & (interrupts >> 16) != 0 {
-				self.spsr[spsr_index(CpuMode::Irq).unwrap()] = self.cpsr;
+	pub fn step(&mut self, mem: &mut Memory, sys: &mut System) {
+		if !self.flag(flags::DISABLE_IRQ) {
+			if (sys.interrupts.control >> 16) != 0 {
+				self.spsr[spsr_index(CpuMode::Irq).unwrap()] = self.cpsr();
 				self.set_register(
 					register_index(CpuMode::Irq, Self::LINK),
 					self.pc().wrapping_sub(if self.flag(flags::THUMB) { 0 } else { 4 }),
 				);
 				self.set_flag(flags::THUMB, false);
-				self.set_mode(CpuMode::Irq);
+				self.mode = CpuMode::Irq;
 				self.set_flag(flags::DISABLE_IRQ, true);
-				self.set_pc(0x18);
+				self.set_register(Self::PC, 0x18);
 				self.cycle();
-				sys.cpu_paused = false;
-			} else if sys.cpu_paused {
+				self.paused = false;
+			} else if self.paused {
 				self.cycle();
 				return;
 			}
 		}
 
-		let mode = CpuMode::try_from((self.cpsr & 0b1111) as u8).expect("invalid CPSR mode");
 		let address = self.pc().wrapping_sub(u32::from(self.pipeline_size) * self.instruction_size());
-		let opcode = self.load_dynamic_width(sys, address, self.instruction_size() as u8);
+		let opcode = self.read(mem, sys, address, self.instruction_size() as u8, self.pc_sequential);
+		self.pc_sequential = true;
+
 		let (cond, instruction) = if self.flag(flags::THUMB) {
-			Instruction::parse_thumb(opcode, mode, self.pc())
+			Instruction::parse_thumb(opcode, self.mode, address)
 		} else {
-			Instruction::parse(opcode, mode)
+			Instruction::parse(opcode, self.mode)
 		}
 		.expect("invalid instruction");
 
@@ -225,42 +243,42 @@ impl Cpu {
 					register_index(CpuMode::Supervisor, Self::LINK),
 					self.pc().wrapping_sub(self.instruction_size()),
 				);
-				self.spsr[spsr_index(CpuMode::Supervisor).unwrap()] = self.cpsr;
-				self.set_mode(CpuMode::Supervisor);
+				self.spsr[spsr_index(CpuMode::Supervisor).unwrap()] = self.cpsr();
+				self.mode = CpuMode::Supervisor;
 				self.set_flag(flags::THUMB, false);
 				self.set_flag(flags::DISABLE_IRQ, true);
-				self.set_pc(0x08);
+				self.set_register(Self::PC, 0x08);
 			}
 			Instruction::Branch { offset, link_register } => {
 				let pc = self.pc();
 				if self.flag(flags::THUMB)
 					&& let Some(link_register) = link_register
 				{
-					self.set_pc(self.register(link_register).wrapping_add(offset.cast_unsigned()));
+					self.cycle();
+					self.set_register(Self::PC, self.register(link_register).wrapping_add(offset.cast_unsigned()));
 					self.set_register(link_register, pc - 1);
 				} else {
 					if let Some(link_register) = link_register {
 						self.set_register(link_register, pc - 4);
 					}
-					self.set_pc(pc.wrapping_add_signed(offset));
+					self.set_register(Self::PC, pc.wrapping_add_signed(offset));
 				}
 			}
 			Instruction::LoadPsr { spsr, target } => {
-				let value = if let Some(spsr) = spsr { self.spsr[spsr] } else { self.cpsr };
+				let value = if let Some(spsr) = spsr { self.spsr[spsr] } else { self.cpsr() };
 				self.set_register(target, value);
 			}
 			Instruction::StorePsr { spsr, source, mask } => {
-				let value = self.resolve_offset(source, false);
-				let psr = if let Some(spsr) = spsr {
-					&mut self.spsr[spsr]
+				let value = self.resolve_offset(source, false) & mask;
+				if let Some(spsr) = spsr {
+					self.spsr[spsr] = self.spsr[spsr] & !mask | value;
 				} else {
 					assert!(
 						!mask.bit(flags::THUMB) || self.flag(flags::THUMB) == value.bit(flags::THUMB),
 						"changing thumb mode during PSR transfer"
 					);
-					&mut self.cpsr
-				};
-				*psr = *psr & !mask | value & mask;
+					self.set_cpsr(self.cpsr() & !mask | value);
+				}
 			}
 			Instruction::BlockDataTransfer { load, registers, load_spsr, index } => {
 				let mut address = self.register(index.base);
@@ -279,20 +297,22 @@ impl Cpu {
 					self.cycle();
 				}
 				let registers = if registers.is_empty() { vec![Self::PC] } else { registers };
+				let mut sequential = false;
 				for register in registers {
 					if load {
-						let value = self.read(sys, address);
+						let value = self.read(mem, sys, address, 4, sequential);
 						self.set_register(register, value);
 					} else {
-						self.write(sys, address, register, 4);
+						self.write(mem, sys, address, register, 4, sequential);
 					}
 					address = address.wrapping_add(4);
+					sequential = true;
 				}
 				if index.write_back {
 					self.set_register(index.base, updated_base);
 				}
 				if let Some(spsr) = load_spsr {
-					self.cpsr = self.spsr[spsr];
+					self.set_cpsr(self.spsr[spsr]);
 				}
 			}
 			Instruction::SingleDataTransfer { load, index, target, offset, size } => {
@@ -300,10 +320,11 @@ impl Cpu {
 				let address = self.resolve_indexing(index, offset);
 				if load {
 					self.cycle();
-					let value = self.load_dynamic_width(sys, address, size);
+					let value = self.read(mem, sys, address, size, false);
 					self.set_register(target, value);
 				} else {
-					self.write(sys, address, target, size);
+					self.write(mem, sys, address, target, size, false);
+					self.pc_sequential = false;
 				}
 			}
 			Instruction::HalfwordDataTransfer { mode, index, target, offset } => {
@@ -314,16 +335,17 @@ impl Cpu {
 					"bit 0 set for halfword load/store"
 				);
 				if let HalfwordDataTransferMode::StoreHalfword = mode {
-					self.write(sys, address, target, 2);
+					self.write(mem, sys, address, target, 2, false);
+					self.pc_sequential = false;
 				} else {
 					self.cycle();
 					let value = match mode {
 						HalfwordDataTransferMode::LoadSignedByte => {
-							i32::from(self.load_dynamic_width(sys, address, 1) as i8).cast_unsigned()
+							i32::from(self.read(mem, sys, address, 1, false) as i8).cast_unsigned()
 						}
-						HalfwordDataTransferMode::LoadUnsignedHalfword => self.load_dynamic_width(sys, address, 2),
+						HalfwordDataTransferMode::LoadUnsignedHalfword => self.read(mem, sys, address, 2, false),
 						HalfwordDataTransferMode::LoadSignedHalfword => {
-							i32::from(self.load_dynamic_width(sys, address, 2) as i16).cast_unsigned()
+							i32::from(self.read(mem, sys, address, 2, false) as i16).cast_unsigned()
 						}
 						HalfwordDataTransferMode::StoreHalfword => unreachable!(),
 					};
@@ -333,13 +355,13 @@ impl Cpu {
 			Instruction::BranchAndExchange { register } => {
 				let target = self.register(register);
 				self.set_flag(flags::THUMB, target.bit(0));
-				self.set_pc(target);
+				self.set_register(Self::PC, target);
 			}
 			Instruction::SingleDataSwap { source, target, base, size } => {
 				let address = self.register(base);
 				self.cycle();
-				let value = self.load_dynamic_width(sys, address, size);
-				self.write(sys, address, source, size);
+				let value = self.read(mem, sys, address, size, false);
+				self.write(mem, sys, address, source, size, false);
 				self.set_register(target, value);
 			}
 			Instruction::Multiply { operand1, operand2, accumulate, target, set_flags } => {
@@ -369,6 +391,7 @@ impl Cpu {
 				signed,
 				set_flags,
 			} => {
+				self.cycle();
 				let operand1 = self.register(operand1);
 				let operand2 = self.register(operand2);
 				let accumulate = if accumulate {
@@ -438,7 +461,7 @@ impl Cpu {
 						self.set_flag(flags::ZERO, result == 0);
 					}
 					DataProcessingCpsr::LoadSpsr(spsr) => {
-						self.cpsr = self.spsr[spsr];
+						self.set_cpsr(self.spsr[spsr]);
 					}
 					DataProcessingCpsr::Unchanged => {}
 				}

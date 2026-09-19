@@ -1,7 +1,6 @@
-use crate::{Bits, Interrupts, read_bytes};
+use crate::{Bits, Interrupts};
 use sdl2::VideoSubsystem;
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::rect::Rect;
 use sdl2::render::{Texture, TextureAccess, WindowCanvas};
 
 pub const SCALE: u32 = 3;
@@ -18,16 +17,17 @@ pub struct Ppu {
 	pub line: u8,
 	pub hblank: bool,
 	wait_cycles: u16,
-	pub palettes: [u8; 0x400],
+	pub palettes: [u32; 0x100],
 	pub vram: Vec<u8>,
-	registers: [u8; 0x60],
-	pub oam: [u8; 0x400],
+	registers: [u32; 0x18],
+	pub oam: [u32; 0x100],
 	reference_points: [i64; 4],
 	texture: Texture,
+	frame: Vec<u8>,
 }
 
-const DISPSTAT: u32 = 0x4;
-const VCOUNT: u32 = 0x5;
+const DISPCNT: usize = 0;
+const DISPSTAT: usize = 1;
 
 const PIXELS_PER_TILE: usize = 8;
 const BYTES_PER_MAP_ENTRY: usize = 2;
@@ -59,7 +59,12 @@ impl Ppu {
 		Self {
 			texture: canvas
 				.texture_creator()
-				.create_texture(PixelFormatEnum::BGR555, TextureAccess::Static, SCREEN_WIDTH as u32, u32::from(SCREEN_HEIGHT))
+				.create_texture(
+					PixelFormatEnum::BGR555,
+					TextureAccess::Static,
+					SCREEN_WIDTH as u32,
+					u32::from(SCREEN_HEIGHT),
+				)
 				.unwrap(),
 			canvas,
 			line: 0,
@@ -70,34 +75,38 @@ impl Ppu {
 			reference_points: [0; _],
 			registers: [0; _],
 			vram: vec![0; 0x18000],
+			frame: vec![0; SCREEN_WIDTH * usize::from(SCREEN_HEIGHT) * 2],
 		}
 	}
 
 	fn get_window(&self, x: usize, object_window: ObjectWindow) -> u8 {
-		let control = self.control();
+		let control = self.registers[DISPCNT];
 		if control >> 13 == 0 {
 			return 0b11111;
 		}
+		let window = self.registers[0x12];
 		for i in 0..2 {
 			let x = x as u8;
-			if !control.bit(13 + (i as u16)) {
+			if !control.bit(13 + (i as u32)) {
 				continue;
 			}
-			let offset = 0x40 + i * 2;
-			if self.registers[offset] > x
-				&& self.registers[offset + 1] <= x
-				&& self.registers[offset + 4] > self.line
-				&& self.registers[offset + 5] <= self.line
+			let offset = i * 2;
+			let width = self.registers[0x10].to_le_bytes();
+			let height = self.registers[0x11].to_le_bytes();
+			if (width[offset]) > x
+				&& (width[offset + 1]) <= x
+				&& (height[offset]) > self.line
+				&& (height[offset + 1]) <= self.line
 			{
-				return self.registers[0x48 + i];
+				return (window >> (i * 8)) as u8;
 			}
 		}
 		if let Some(object_window) = object_window
 			&& object_window[x] != 0xffff
 		{
-			return self.registers[0x4b];
+			return (window >> 24) as u8;
 		}
-		self.registers[0x4a]
+		(window >> 16) as u8
 	}
 
 	fn pixel_from_tile(&self, tile_line: usize, tile_x: usize, palette: Option<u8>) -> Option<u8> {
@@ -127,21 +136,21 @@ impl Ppu {
 
 	fn colour_from_palette(&self, offset: usize, index: u8) -> u16 {
 		let palette_index = offset + usize::from(index) * 2;
-		u16::from_le_bytes(self.palettes[palette_index..=palette_index + 1].try_into().unwrap())
+		((self.palettes[palette_index / 4] >> (16 * (index % 2))) as u16) & 0x7fff
 	}
 
 	fn render_objects(
 		&self,
-		objects: &mut Vec<([u8; 6], u8)>,
+		objects: &mut Vec<([u32; 2], u8)>,
 		max_priority: u8,
 		object_window: ObjectWindow,
 		rendered: &mut [u16; SCREEN_WIDTH],
 	) {
-		let control = self.control();
+		let control = self.registers[DISPCNT];
 		let Some(end) = objects.iter().rposition(|(_, priority)| *priority <= max_priority) else { return };
 		for (object, _) in objects.drain(0..=end) {
-			let size = object[3] >> 6;
-			let shape = object[1] >> 6;
+			let size = object[0] >> 30;
+			let shape = (object[0] >> 14) & 0b11;
 			let (width, height) = if shape > 0 {
 				let (larger, smaller) = match size {
 					0 => (16, 8),
@@ -155,26 +164,24 @@ impl Ppu {
 				let size = (1 << size) * PIXELS_PER_TILE;
 				(size, size)
 			};
-			let outer_height = if object[1].bit(1) { height * 2 } else { height };
-			let outer_width = if object[1].bit(1) { width * 2 } else { width };
+			let (outer_height, outer_width) = if object[0].bit(9) { (height * 2, width * 2) } else { (height, width) };
 			let offset_per_tile_row = if control.bit(6) { width / PIXELS_PER_TILE } else { 0x20 };
-			let object_y = usize::from(self.line.wrapping_sub(object[0]));
+			let object_y = usize::from(self.line.wrapping_sub(object[0] as u8));
 			if object_y >= outer_height {
 				continue;
 			}
-			let object_y = if object[1].bit(4) { self.mosaic(object_y, 8) } else { object_y };
+			let mosaic = object[0].bit(12);
+			let object_y = if mosaic { self.mosaic(object_y, 8) } else { object_y };
 			assert_eq!((object[1] >> 2) & 0b11, 0, "obj mode");
 
-			let x = usize::from(u16::from_le_bytes(object[2..4].try_into().unwrap()) & 0x1ff);
-			let tile_number = usize::from(u16::from_le_bytes(object[4..6].try_into().unwrap()) & 0x3ff);
-			let use_standard_palette = object[1].bit(5);
+			let x = ((object[0] >> 16) & 0x1ff) as usize;
+			let tile_number = (object[1] & 0x3ff) as usize;
+			let use_standard_palette = object[0].bit(13);
 			let pixels_per_byte = if use_standard_palette { 1 } else { 2 };
 			let tile_size = PIXELS_PER_TILE.pow(2) / pixels_per_byte;
-			let scaling_data = if object[1].bit(0) {
-				let scaling_index = usize::from((object[3] >> 1) & 0b11111);
-				Some(std::array::from_fn::<_, 4, _>(|i| {
-					i32::from(i16::from_le_bytes(self.oam[6 + scaling_index * 32 + i * 8..][..2].try_into().unwrap()))
-				}))
+			let scaling_data: Option<[_; 4]> = if object[0].bit(8) {
+				let scaling_index = ((object[0] >> 25) & 0b11111) as usize;
+				Some(std::array::from_fn(|i| i32::from((self.oam[1 + scaling_index * 8 + i * 2] >> 16) as i16)))
 			} else {
 				None
 			};
@@ -184,7 +191,7 @@ impl Ppu {
 				if x >= SCREEN_WIDTH {
 					continue;
 				}
-				let object_x = if object[1].bit(4) { self.mosaic(object_x, 12) } else { object_x };
+				let object_x = if mosaic { self.mosaic(object_x, 12) } else { object_x };
 				#[allow(clippy::cast_possible_wrap)]
 				let (object_y, object_x) = if let Some(scaling_data) = scaling_data {
 					let x1 = object_x as i32 - (outer_width / 2) as i32;
@@ -194,8 +201,8 @@ impl Ppu {
 					(y.cast_unsigned() as usize, x.cast_unsigned() as usize)
 				} else {
 					(
-						if object[3].bit(5) { height - object_y - 1 } else { object_y },
-						if object[3].bit(4) { width - object_x - 1 } else { object_x },
+						if object[0].bit(29) { height - object_y - 1 } else { object_y },
+						if object[0].bit(28) { width - object_x - 1 } else { object_x },
 					)
 				};
 				if !(0..width).contains(&object_x) || !(0..height).contains(&object_y) {
@@ -209,7 +216,7 @@ impl Ppu {
 				let colour = self.pixel_from_tile(
 					tile_line,
 					tile_x,
-					if use_standard_palette { None } else { Some(object[5] >> 4) },
+					if use_standard_palette { None } else { Some(((object[1] >> 12) & 0b1111) as u8) },
 				);
 				if let Some(colour) = colour {
 					self.render_pixel(rendered, x, self.colour_from_palette(0x200, colour), 4, object_window);
@@ -218,49 +225,44 @@ impl Ppu {
 		}
 	}
 
-	fn bg_control(&self, layer: u16) -> u16 {
-		u16::from_le_bytes(self.registers[8 + (layer as usize) * 2..][..2].try_into().unwrap())
+	fn bg_control(&self, layer: u32) -> u16 {
+		(self.registers[2 + (layer as usize) / 2] >> ((layer % 2) * 16)) as u16
 	}
 
 	fn load_reference_point(&mut self, index: usize) {
-		let register = &self.registers[0x28 + 0x10 * (index / 2) + 4 * (index % 2)..];
-		self.reference_points[index] = i64::from(i32::from_le_bytes(register[..4].try_into().unwrap()) << 4) >> 4;
+		let register = self.registers[0xa + 4 * (index / 2) + (index % 2)];
+		self.reference_points[index] = i64::from(register.cast_signed() << 4) >> 4;
 	}
 
-	fn bg_scaling_data(&mut self, layer: u16) -> (i64, i64, [i64; 4]) {
-		let reference_points = &mut self.reference_points[usize::from(layer - 2) * 2..];
+	fn bg_scaling_data(&mut self, layer: u32) -> (i64, i64, [i64; 4]) {
+		let reference_points = &mut self.reference_points[(layer - 2) as usize * 2..];
 		let x = reference_points[0];
 		let y = reference_points[1];
-		let registers = &self.registers[usize::from(layer) * 0x10..];
-		let data = std::array::from_fn::<_, 4, _>(|i| {
-			i64::from(i16::from_le_bytes(registers[i * 2..][..2].try_into().unwrap()))
-		});
+		let registers = &self.registers[8 + ((layer - 2) * 4) as usize..];
+		let data =
+			std::array::from_fn::<_, 4, _>(|i| i64::from(((registers[i / 2] >> (16 * (i % 2))) as u16).cast_signed()));
 		reference_points[0] += data[1];
 		reference_points[1] += data[3];
 		(y, x, data)
 	}
 
-	fn objects(&self) -> impl Iterator<Item = ([u8; 6], u8)> {
-		let mode = self.control() & 0b111;
+	fn objects(&self) -> impl Iterator<Item = ([u32; 2], u8)> {
+		let mode = self.registers[DISPCNT] & 0b111;
 		self.oam
-			.chunks(8)
+			.chunks(2)
 			.filter(move |data| {
-				let tile_number = usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap()) & 0x3ff);
-				(data[1] & 0b11) != 0b10 && mode < 3 || tile_number >= 512
+				let tile_number = (data[1] & 0x3ff) as usize;
+				((data[0] >> 8) & 0b11) != 0b10 && mode < 3 || tile_number >= 512
 			})
-			.map(|data| (data[0..6].try_into().unwrap(), (data[5] >> 2) & 0b11))
-	}
-
-	fn control(&self) -> u16 {
-		u16::from_le_bytes(self.registers[0..2].try_into().unwrap())
+			.map(|data| (data.try_into().unwrap(), ((data[1] >> 10) & 0b11) as u8))
 	}
 
 	fn mosaic(&self, value: usize, shift: u8) -> usize {
-		value - (value % usize::from((self.registers[0x4c + usize::from(shift / 8)] >> (shift % 8) & 0xf) + 1))
+		value - (value % ((self.registers[0x13] >> shift & 0xf) as usize + 1))
 	}
 
 	fn render_line(&mut self) {
-		let control = self.control();
+		let control = self.registers[DISPCNT];
 		if control.bit(7) {
 			return;
 		}
@@ -268,14 +270,14 @@ impl Ppu {
 
 		let object_window = if control.bit(15) {
 			let mut window = [0xffffu16; SCREEN_WIDTH];
-			let mut objects: Vec<_> = self.objects().filter(|(data, _)| (data[1] >> 2) & 0b11 == 0b10).collect();
+			let mut objects: Vec<_> = self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 == 0b10).collect();
 			self.render_objects(&mut objects, 4, None, &mut window);
 			Some(window)
 		} else {
 			None
 		};
 		let mut objects = if control.bit(12) {
-			self.objects().filter(|(data, _)| (data[1] >> 2) & 0b11 != 0b10).collect()
+			self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 != 0b10).collect()
 		} else {
 			vec![]
 		};
@@ -286,7 +288,7 @@ impl Ppu {
 				let mut layers = Vec::new();
 				for layer in 0..4 {
 					if control.bit(8 + layer)
-						&& (layer == 2 || (0..=1).contains(&layer) && mode != 2 || layer == 3 && mode == 2)
+						&& (layer == 2 || (0..=1).contains(&layer) && mode != 2 || layer == 3 && mode == 0)
 					{
 						layers.push((layer, (self.bg_control(layer) & 0b11) as u8));
 					}
@@ -323,12 +325,10 @@ impl Ppu {
 							fn pixel_to_map_index(pixel: usize) -> usize {
 								(pixel % MAP_WIDTH) / PIXELS_PER_TILE
 							}
-							fn get_scroll(registers: &[u8]) -> usize {
-								usize::from(u16::from_le_bytes(registers[..2].try_into().unwrap()) & 0x1ff)
-							}
-							let scroll = &self.registers[0x10 + (layer as usize) * 4..];
-							let bg_x = bg_x + get_scroll(scroll);
-							let bg_y = y + get_scroll(&scroll[2..]);
+
+							let scroll = self.registers[4 + (layer as usize)];
+							let bg_x = bg_x + (scroll & 0x1ff) as usize;
+							let bg_y = y + (scroll >> 16 & 0x1ff) as usize;
 
 							let mut area_index = 0;
 							if control.bit(14) && bg_x % 512 >= MAP_WIDTH {
@@ -405,20 +405,23 @@ impl Ppu {
 		self.render_objects(&mut objects, 4, object_window.as_ref(), &mut rendered);
 
 		let default_colour = self.colour_from_palette(0, 0);
-		let pixels: Vec<u8> = rendered
-			.into_iter()
-			.flat_map(|colour| (if colour == 0xffff { default_colour } else { colour }).to_le_bytes())
-			.collect();
-		self.texture.update(Rect::new(0, i32::from(self.line), SCREEN_WIDTH as u32, 1), &pixels, SCREEN_WIDTH * 2).unwrap();
+		let start = usize::from(self.line) * SCREEN_WIDTH * 2;
+		self.frame.splice(
+			start..(start + SCREEN_WIDTH * 2),
+			rendered
+				.into_iter()
+				.flat_map(|colour| (if colour == 0xffff { default_colour } else { colour }).to_le_bytes()),
+		);
 	}
 
 	pub(crate) fn step(&mut self, interrupts: &mut Interrupts) {
-		let dispstat = self.registers[DISPSTAT as usize];
+		let dispstat = self.registers[DISPSTAT];
 		if self.wait_cycles > 0 {
 			self.wait_cycles -= 1;
 			return;
 		}
 		if self.hblank || self.line >= SCREEN_HEIGHT {
+			self.line += 1;
 			match self.line {
 				SCREEN_HEIGHT => {
 					for i in 0..4 {
@@ -429,14 +432,14 @@ impl Ppu {
 					}
 				}
 				TOTAL_LINES => {
-					self.line = 0xff;
+					self.line = 0;
+					self.texture.update(None, &self.frame, SCREEN_WIDTH * 2).unwrap();
 					self.canvas.copy(&self.texture, None, None).unwrap();
 					self.canvas.present();
 				}
 				_ => {}
 			}
-			self.line = self.line.wrapping_add(1);
-			if dispstat.bit(5) && self.line == self.registers[VCOUNT as usize] {
+			if dispstat.bit(5) && self.line == (dispstat >> 8) as u8 {
 				interrupts.interrupt(2);
 			}
 			self.wait_cycles = if self.hblank { RENDER_CYCLES } else { LINE_CYCLES };
@@ -452,23 +455,19 @@ impl Ppu {
 	}
 
 	pub fn read_register(&self, address: u32) -> u32 {
-		match address {
-			DISPSTAT => {
-				let mut dispstat = u32::from(u16::from_le_bytes(self.registers[4..6].try_into().unwrap()));
-				dispstat |= u32::from(self.line) << 16;
-				dispstat.set_bit(0, self.line >= SCREEN_HEIGHT);
-				dispstat.set_bit(1, self.hblank);
-				dispstat.set_bit(2, self.line == self.registers[VCOUNT as usize]);
-				dispstat
-			}
-			_ => {
-				read_bytes(&self.registers, address)
-			}
+		let index = (address / 4) as usize;
+		let mut value = self.registers[index];
+		if index == DISPSTAT {
+			value = value & 0xffff | u32::from(self.line) << 16;
+			value.set_bit(0, self.line >= SCREEN_HEIGHT);
+			value.set_bit(1, self.hblank);
+			value.set_bit(2, self.line == (value >> 8) as u8);
 		}
+		value
 	}
 
-	pub fn write_register(&mut self, address: u32, value: u8) {
-		self.registers[address as usize] = value;
+	pub fn write_register(&mut self, address: u32, value: u32) {
+		self.registers[(address / 4) as usize] = value;
 		if matches!(address, 0x28..0x2f | 0x38..0x3f) {
 			let address = address - 0x28;
 			self.load_reference_point(((address % 8) / 4 + (address / 0x10) * 2) as usize);
