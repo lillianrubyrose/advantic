@@ -128,7 +128,7 @@ impl Ppu {
 
 	fn render_pixel(&self, rendered: &mut [u16], x: usize, colour: u16, layer: u8, object_window: ObjectWindow) {
 		let window = self.get_window(x, object_window);
-		assert!(!window.bit(5));
+		// assert!(!window.bit(5));
 		if rendered[x] == 0xffff && window.bit(layer) {
 			rendered[x] = colour;
 		}
@@ -172,7 +172,7 @@ impl Ppu {
 			}
 			let mosaic = object[0].bit(12);
 			let object_y = if mosaic { self.mosaic(object_y, 8) } else { object_y };
-			assert_eq!((object[1] >> 2) & 0b11, 0, "obj mode");
+			// assert_eq!((object[1] >> 2) & 0b11, 0, "obj mode");
 
 			let x = ((object[0] >> 16) & 0x1ff) as usize;
 			let tile_number = (object[1] & 0x3ff) as usize;

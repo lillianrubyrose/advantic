@@ -190,7 +190,7 @@ impl Cpu {
 		mem.write(sys, parsed, self.register(register), size);
 	}
 
-	pub fn step(&mut self, mem: &mut Memory, sys: &mut System) {
+	pub fn step(&mut self, mem: &mut Memory, sys: &mut System) -> bool {
 		if !self.flag(flags::DISABLE_IRQ) {
 			if (sys.interrupts.control >> 16) != 0 {
 				self.spsr[spsr_index(CpuMode::Irq).unwrap()] = self.cpsr();
@@ -206,7 +206,7 @@ impl Cpu {
 				self.paused = false;
 			} else if self.paused {
 				self.cycle();
-				return;
+				return false;
 			}
 		}
 
@@ -234,7 +234,7 @@ impl Cpu {
 		self.pipeline_size = 1;
 		if u8::from(condition) ^ (cond & 1) == 0 {
 			self.pipeline_load();
-			return;
+			return true;
 		}
 
 		match instruction {
@@ -477,5 +477,6 @@ impl Cpu {
 			}
 		}
 		self.pipeline_load();
+		true
 	}
 }

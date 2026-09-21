@@ -21,7 +21,7 @@ use crate::ppu::{LINE_CYCLES, TOTAL_LINES};
 use crate::timer::Timers;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Add;
 use std::time::{Duration, Instant};
 
@@ -100,11 +100,19 @@ fn main() {
 	};
 
 	let mut time = Instant::now();
+	let instruction_start = Instant::now();
+	let mut instruction_last_print = instruction_start;
+	let mut instruction_interval = 0u64;
+	let mut instruction_total = 0u64;
+	let mut instruction_history = VecDeque::from([(instruction_start, 0u64)]);
 	let mut event_pump = sdl_context.event_pump().unwrap();
 	let mut booting = true;
 	'running: loop {
 		let mut cycle = cpu.cycle;
-		cpu.step(&mut mem, &mut sys);
+		if cpu.step(&mut mem, &mut sys) {
+			instruction_interval += 1;
+			instruction_total += 1;
+		}
 		cpu.cycle = cpu.cycle.wrapping_add(mem.dma(&mut sys));
 		loop {
 			if cycle == cpu.cycle {
@@ -113,6 +121,25 @@ fn main() {
 			sys.ppu.step(&mut sys.interrupts);
 			sys.timer.step(&mut sys.interrupts, cycle);
 			if cycle.is_multiple_of(FRAME_CYCLES) {
+				let now = Instant::now();
+				instruction_history.push_back((now, instruction_total));
+				while instruction_history.len() > 1
+					&& now.duration_since(instruction_history[1].0) >= Duration::from_secs(10)
+				{
+					instruction_history.pop_front();
+				}
+				let print_elapsed = now.duration_since(instruction_last_print);
+				if print_elapsed >= Duration::from_secs(1) {
+					let current = instruction_interval as f64 / print_elapsed.as_secs_f64() / 1_000_000.0;
+					let (window_start, window_instructions) = instruction_history.front().copied().unwrap();
+					let average = (instruction_total - window_instructions) as f64
+						/ now.duration_since(window_start).as_secs_f64()
+						/ 1_000_000.0;
+					println!("{current:.2} MIPS (AVG: {average:.2} MIPS)");
+					instruction_interval = 0;
+					instruction_last_print = now;
+				}
+
 				for event in event_pump.poll_iter() {
 					match event {
 						Event::Quit { .. } => {
@@ -134,7 +161,7 @@ fn main() {
 					booting = false;
 				}
 				if !booting {
-					std::thread::sleep(duration);
+					// std::thread::sleep(duration);
 				}
 				time = Instant::now();
 			}

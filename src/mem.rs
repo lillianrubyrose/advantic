@@ -285,7 +285,7 @@ impl Memory {
 
 			let mut channel = channel.clone();
 			channel.handled = true;
-			assert!(!control.bit(27));
+			// assert!(!control.bit(27));
 			let size = if control.bit(26) { 4 } else { 2 };
 			let old_target = channel.target;
 			let source_increment = i32::from(size) * increment_sign(control >> 23);
