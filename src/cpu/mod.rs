@@ -280,10 +280,10 @@ impl Cpu {
 					self.set_cpsr(self.cpsr() & !mask | value);
 				}
 			}
-			Instruction::BlockDataTransfer { load, registers, load_spsr, index } => {
+			Instruction::BlockDataTransfer { load, mut registers, register_mode, load_spsr, index } => {
 				let mut address = self.register(index.base);
 
-				let offset = if registers.is_empty() { 0x40 } else { registers.len() as u32 * 4 };
+				let offset = if registers == 0 { 0x40 } else { registers.count_ones() * 4 };
 				let updated_base = if index.subtract {
 					address = address.wrapping_sub(offset);
 					address
@@ -296,9 +296,14 @@ impl Cpu {
 				if load {
 					self.cycle();
 				}
-				let registers = if registers.is_empty() { vec![Self::PC] } else { registers };
+				if registers == 0 {
+					registers = 1 << Self::PC;
+				}
 				let mut sequential = false;
-				for register in registers {
+				while registers != 0 {
+					let logi_reg = registers.trailing_zeros();
+					registers &= registers - 1;
+					let register = register_index(register_mode, logi_reg);
 					if load {
 						let value = self.read(mem, sys, address, 4, sequential);
 						self.set_register(register, value);

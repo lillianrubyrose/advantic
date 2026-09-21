@@ -1,4 +1,4 @@
-use crate::cpu::{Cpu, CpuMode, Bits};
+use crate::cpu::{Bits, Cpu, CpuMode};
 use int_enum::IntEnum;
 
 pub fn register_index(mode: CpuMode, register: u32) -> usize {
@@ -130,7 +130,7 @@ impl DataProcessingOpcode {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Instruction {
 	Interrupt,
 	Branch {
@@ -139,7 +139,8 @@ pub enum Instruction {
 	},
 	BlockDataTransfer {
 		load: bool,
-		registers: Vec<usize>,
+		registers: u16,
+		register_mode: CpuMode,
 		index: Indexing,
 		load_spsr: Option<usize>,
 	},
@@ -203,15 +204,13 @@ fn thumb_register(instruction: u32, bit: u32, mode: CpuMode) -> usize {
 	register_index(mode, (instruction >> bit) & 0b111)
 }
 
-fn parse_register_list(mode: CpuMode, instruction: u32, index: &Indexing) -> Result<Vec<usize>, &'static str> {
-	let mut registers: Vec<usize> = Vec::new();
-	for i in 0..16 {
-		if instruction.bit(i) {
-			let register = register_index(mode, i);
-			if index.write_back && register == index.base {
+fn parse_register_list(mode: CpuMode, instruction: u32, index: &Indexing) -> Result<u16, &'static str> {
+	let registers = instruction as u16;
+	if index.write_back {
+		for register in 0..16 {
+			if registers.bit(register) && register_index(mode, register.into()) == index.base {
 				return Err("base included in Rlist with write-back enabled");
 			}
-			registers.push(register);
 		}
 	}
 	Ok(registers)
@@ -259,6 +258,7 @@ impl Instruction {
 				Self::BlockDataTransfer {
 					load,
 					registers: parse_register_list(mode, instruction, &index)?,
+					register_mode: mode,
 					index,
 					load_spsr,
 				}
@@ -439,6 +439,7 @@ impl Instruction {
 					Indexing { base: thumb_register(instruction, 8, mode), write_back: true, ..Indexing::default() };
 				Self::BlockDataTransfer {
 					registers: parse_register_list(mode, instruction & 0xff, &index)?,
+					register_mode: mode,
 					load: instruction.bit(11),
 					index,
 					load_spsr: None,
@@ -455,9 +456,9 @@ impl Instruction {
 					};
 					let mut registers = parse_register_list(mode, instruction & 0xff, &index)?;
 					if instruction.bit(8) {
-						registers.push(if load { Cpu::PC } else { register_index(mode, Cpu::LINK) });
+						registers |= 1 << if load { Cpu::PC } else { Cpu::LINK as usize };
 					}
-					Self::BlockDataTransfer { registers, load, index, load_spsr: None }
+					Self::BlockDataTransfer { registers, register_mode: mode, load, index, load_spsr: None }
 				} else {
 					let sp = register_index(mode, Cpu::SP);
 					Self::DataProcessing {
