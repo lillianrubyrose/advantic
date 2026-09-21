@@ -7,7 +7,7 @@ struct DmaChannel {
 	pub source: u32,
 	pub target: u32,
 	pub count: u32,
-	pub handled: bool,
+	pub control: u32,
 }
 
 impl DmaChannel {
@@ -51,6 +51,9 @@ pub struct Memory {
 	bios: Vec<u32>,
 	io: [u32; 0x100],
 	dma: [DmaChannel; 4],
+	dma_enabled_mask: u8,
+	dma_handled_mask: u8,
+	dma_trigger_masks: [u8; 4],
 }
 
 fn update_u32(current: u32, new: u32, address: u32, size: u8) -> u32 {
@@ -94,6 +97,9 @@ impl Memory {
 			ram: vec![0; 0x14500],
 			io: [0; _],
 			dma: std::array::from_fn(|index| DmaChannel { index, ..Default::default() }),
+			dma_enabled_mask: 0,
+			dma_handled_mask: 0,
+			dma_trigger_masks: [0; 4],
 		}
 	}
 
@@ -212,15 +218,27 @@ impl Memory {
 					}
 					0xb8 | 0xc4 | 0xd0 | 0xdc => {
 						let index = ((aligned_address - 0xb8) / 0xc) as usize;
-						let channel = &mut self.dma[index];
-						let registers = &self.io[channel.register_offset()..];
-						let value = update_u32(registers[2], value, parsed.address, size);
+						let offset = self.dma[index].register_offset();
+						let old_control = self.io[offset + 2];
+						let value = update_u32(old_control, value, parsed.address, size);
+						let channel_bit = 1 << index;
 
-						if value.bit(31) && !registers[2].bit(31) {
-							channel.source = registers[0] & 0xfff_ffff;
-							channel.target = registers[1] & 0xfff_ffff;
+						if value.bit(31) && !old_control.bit(31) {
+							let channel = &mut self.dma[index];
+							channel.source = self.io[offset] & 0xfff_ffff;
+							channel.target = self.io[offset + 1] & 0xfff_ffff;
 							channel.load_count(value);
-							channel.handled = false;
+							self.dma_handled_mask &= !channel_bit;
+						}
+						self.dma[index].control = value;
+						self.dma_enabled_mask.set_bit(index as u8, value.bit(31));
+						for trigger_mask in &mut self.dma_trigger_masks {
+							*trigger_mask &= !channel_bit;
+						}
+						if value.bit(31) {
+							self.dma_trigger_masks[((value >> 28) & 0b11) as usize] |= channel_bit;
+						} else {
+							self.dma_handled_mask &= !channel_bit;
 						}
 					}
 					0x100..0x110 => sys.timer.write_register(
@@ -249,7 +267,31 @@ impl Memory {
 		}
 	}
 
+	#[inline]
 	pub fn dma(&mut self, sys: &mut System) -> u32 {
+		if self.dma_enabled_mask == 0 {
+			return 0;
+		}
+
+		let mut triggered = self.dma_trigger_masks[0];
+		if sys.ppu.line == 160 {
+			triggered |= self.dma_trigger_masks[1];
+		}
+		if sys.ppu.hblank {
+			triggered |= self.dma_trigger_masks[2] | (self.dma_trigger_masks[3] & (1 << 3));
+		}
+		for index in 1..=2 {
+			if sys.audio.dma[index - 1].dma_enabled {
+				triggered |= self.dma_trigger_masks[3] & (1 << index);
+			}
+		}
+
+		self.dma_handled_mask &= triggered;
+		let pending = self.dma_enabled_mask & triggered & !self.dma_handled_mask;
+		if pending == 0 { 0 } else { self.dma_active(sys, pending) }
+	}
+
+	fn dma_active(&mut self, sys: &mut System, mut pending: u8) -> u32 {
 		fn increment_sign(control: u32) -> i32 {
 			match (control) & 0b11 {
 				0 | 3 => 1,
@@ -260,31 +302,16 @@ impl Memory {
 		}
 
 		let mut cycles = 0;
-		for i in 0..self.dma.len() {
-			let channel = &mut self.dma[i];
+		while pending != 0 {
+			let i = pending.trailing_zeros() as usize;
+			let channel_bit = 1 << i;
+			pending &= pending - 1;
+			self.dma_handled_mask |= channel_bit;
+
+			let mut channel = self.dma[i].clone();
 			let offset = channel.register_offset();
-			let mut control = self.io[offset + 2];
+			let mut control = channel.control;
 
-			if !control.bit(31) {
-				continue;
-			}
-			let cond = match (control >> 28) & 0b11 {
-				1 => sys.ppu.line == 160,
-				2 => sys.ppu.hblank,
-				3 if channel.index == 3 => sys.ppu.hblank,
-				3 => sys.audio.dma[channel.index - 1].dma_enabled,
-				_ => true,
-			};
-			if !cond {
-				channel.handled = false;
-				continue;
-			}
-			if channel.handled {
-				continue;
-			}
-
-			let mut channel = channel.clone();
-			channel.handled = true;
 			// assert!(!control.bit(27));
 			let size = if control.bit(26) { 4 } else { 2 };
 			let old_target = channel.target;
@@ -315,7 +342,13 @@ impl Memory {
 				}
 			} else {
 				control.set_bit(31, false);
+				channel.control = control;
 				self.io[offset + 2] = control;
+				self.dma_enabled_mask &= !channel_bit;
+				self.dma_handled_mask &= !channel_bit;
+				for trigger_mask in &mut self.dma_trigger_masks {
+					*trigger_mask &= !channel_bit;
+				}
 			}
 			if control.bit(14) {
 				sys.interrupts.interrupt((channel.index + 8) as u32);
