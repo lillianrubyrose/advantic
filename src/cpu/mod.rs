@@ -17,6 +17,13 @@ mod flags {
 	pub const THUMB: u32 = 5;
 }
 
+#[derive(Clone, Copy)]
+struct CacheEntry {
+	key: u64,
+	cond: u8,
+	instruction: Instruction,
+}
+
 #[derive(Debug, Clone, Copy, IntEnum, PartialEq)]
 #[repr(u8)]
 enum CpuMode {
@@ -38,6 +45,7 @@ pub struct Cpu {
 	pub cycle: u32,
 	pc_sequential: bool,
 	paused: bool,
+	icache: Box<[Option<CacheEntry>]>,
 }
 
 impl Cpu {
@@ -55,6 +63,7 @@ impl Cpu {
 			cycle: 0,
 			pc_sequential: false,
 			paused: false,
+			icache: vec![None; 8192].into_boxed_slice(),
 		};
 		cpu.pipeline_load();
 		cpu.pipeline_load();
@@ -190,6 +199,31 @@ impl Cpu {
 		mem.write(sys, parsed, self.register(register), size);
 	}
 
+	#[inline]
+	fn decode_instruction(&mut self, opcode: u32, address: u32) -> (u8, Instruction) {
+		let thumb = self.flag(flags::THUMB);
+		let key = u64::from(opcode)
+			| (u64::from(self.mode as u8) << 32)
+			| (u64::from(thumb) << 40)
+			| (u64::from((address >> 1) & 1) << 41);
+		let index = (address as usize >> 1) & (8192 - 1);
+		if let Some(entry) = self.icache[index]
+			&& entry.key == key
+		{
+			return (entry.cond, entry.instruction);
+		}
+
+		let (cond, instruction) = if thumb {
+			Instruction::parse_thumb(opcode, self.mode, address)
+		} else {
+			Instruction::parse(opcode, self.mode)
+		}
+		.expect("invalid instruction");
+
+		self.icache[index] = Some(CacheEntry { key, cond, instruction });
+		(cond, instruction)
+	}
+
 	pub fn step(&mut self, mem: &mut Memory, sys: &mut System) -> bool {
 		if !self.flag(flags::DISABLE_IRQ) {
 			if (sys.interrupts.control >> 16) != 0 {
@@ -214,12 +248,7 @@ impl Cpu {
 		let opcode = self.read(mem, sys, address, self.instruction_size() as u8, self.pc_sequential);
 		self.pc_sequential = true;
 
-		let (cond, instruction) = if self.flag(flags::THUMB) {
-			Instruction::parse_thumb(opcode, self.mode, address)
-		} else {
-			Instruction::parse(opcode, self.mode)
-		}
-		.expect("invalid instruction");
+		let (cond, instruction) = self.decode_instruction(opcode, address);
 
 		let condition = match cond >> 1 {
 			0b000 => self.flag(flags::ZERO),
