@@ -24,6 +24,8 @@ pub struct Ppu {
 	reference_points: [i64; 4],
 	texture: Texture,
 	frame: Vec<u8>,
+	object_buffer: Vec<([u32; 2], u8)>,
+	window_object_buffer: Vec<([u32; 2], u8)>,
 }
 
 const DISPCNT: usize = 0;
@@ -76,6 +78,8 @@ impl Ppu {
 			registers: [0; _],
 			vram: vec![0; 0x18000],
 			frame: vec![0; SCREEN_WIDTH * usize::from(SCREEN_HEIGHT) * 2],
+			object_buffer: Vec::with_capacity(128),
+			window_object_buffer: Vec::with_capacity(128),
 		}
 	}
 
@@ -270,32 +274,35 @@ impl Ppu {
 
 		let object_window = if control.bit(15) {
 			let mut window = [0xffffu16; SCREEN_WIDTH];
-			let mut objects: Vec<_> = self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 == 0b10).collect();
+			let mut objects = std::mem::take(&mut self.window_object_buffer);
+			objects.extend(self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 == 0b10));
 			self.render_objects(&mut objects, 4, None, &mut window);
+			self.window_object_buffer = objects;
 			Some(window)
 		} else {
 			None
 		};
-		let mut objects = if control.bit(12) {
-			self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 != 0b10).collect()
-		} else {
-			vec![]
-		};
+		let mut objects = std::mem::take(&mut self.object_buffer);
+		if control.bit(12) {
+			objects.extend(self.objects().filter(|(data, _)| (data[0] >> 10) & 0b11 != 0b10));
+		}
 		let mut rendered = [0xffffu16; SCREEN_WIDTH];
-		objects.sort_by(|(_, prio1), (_, prio2)| prio1.cmp(prio2));
+		objects.sort_by_key(|(_, priority)| *priority);
 		match mode {
 			0..=2 => {
-				let mut layers = Vec::new();
+				let mut layers = [(0, 0); 4];
+				let mut n_layers = 0;
 				for layer in 0..4 {
 					if control.bit(8 + layer)
 						&& (layer == 2 || (0..=1).contains(&layer) && mode != 2 || layer == 3 && mode == 0)
 					{
-						layers.push((layer, (self.bg_control(layer) & 0b11) as u8));
+						layers[n_layers] = (layer, (self.bg_control(layer) & 0b11) as u8);
+						n_layers += 1;
 					}
 				}
-				layers.sort_by(|(_, a_prio), (_, b_prio)| a_prio.cmp(b_prio));
+				layers[..n_layers].sort_by_key(|(_, priority)| *priority);
 
-				for (layer, priority) in layers {
+				for (layer, priority) in layers.into_iter().take(n_layers) {
 					self.render_objects(&mut objects, priority, object_window.as_ref(), &mut rendered);
 					let control = self.bg_control(layer);
 					let y = usize::from(self.line);
@@ -403,6 +410,7 @@ impl Ppu {
 			_ => unimplemented!(),
 		}
 		self.render_objects(&mut objects, 4, object_window.as_ref(), &mut rendered);
+		self.object_buffer = objects;
 
 		let default_colour = self.colour_from_palette(0, 0);
 		let start = usize::from(self.line) * SCREEN_WIDTH * 2;
