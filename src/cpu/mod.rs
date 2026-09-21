@@ -70,14 +70,17 @@ impl Cpu {
 		cpu
 	}
 
+	#[inline]
 	fn instruction_size(&self) -> u32 {
 		if self.flag(flags::THUMB) { 2 } else { 4 }
 	}
 
+	#[inline]
 	pub fn pc(&self) -> u32 {
 		self.registers[Self::PC]
 	}
 
+	#[inline]
 	fn pipeline_load(&mut self) {
 		if self.pipeline_size < 2 {
 			self.pipeline_size += 1;
@@ -85,11 +88,22 @@ impl Cpu {
 		}
 	}
 
+	#[inline]
 	fn cycle(&mut self) {
-		self.cycle = self.cycle.wrapping_add(1);
-		self.pipeline_load();
+		self.cycles(1);
 	}
 
+	#[inline]
+	fn cycles(&mut self, cycles: u32) {
+		self.cycle = self.cycle.wrapping_add(cycles);
+		let pipeline_loads = cycles.min(u32::from(2 - self.pipeline_size));
+		if pipeline_loads != 0 {
+			self.pipeline_size += pipeline_loads as u8;
+			self.registers[Self::PC] = self.pc().wrapping_add(pipeline_loads * self.instruction_size());
+		}
+	}
+
+	#[inline]
 	fn register(&self, register: usize) -> u32 {
 		self.registers[register]
 	}
@@ -105,10 +119,12 @@ impl Cpu {
 		}
 	}
 
+	#[inline]
 	fn flag(&self, flag: u32) -> bool {
 		self.cpsr.bit(flag)
 	}
 
+	#[inline]
 	fn cpsr(&self) -> u32 {
 		(self.cpsr & !0b1111) | (1 << 4) | self.mode as u32
 	}
@@ -179,9 +195,7 @@ impl Cpu {
 			eprintln!("reading from unknown address: {address:08x}");
 			return 0;
 		};
-		for _ in 0..parsed.cycles {
-			self.cycle();
-		}
+		self.cycles(parsed.cycles);
 		mem.read(sys, parsed, size)
 	}
 
@@ -190,9 +204,7 @@ impl Cpu {
 			eprintln!("writing to unknown address: {address:08x}");
 			return;
 		};
-		for _ in 0..parsed.cycles {
-			self.cycle();
-		}
+		self.cycles(parsed.cycles);
 		if address == 0x0400_0301 {
 			self.paused = true;
 		}
